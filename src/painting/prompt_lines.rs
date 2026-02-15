@@ -131,9 +131,7 @@ impl<'prompt> PromptLines<'prompt> {
 
         if !before_cursor {
             input += &self.after_cursor;
-            if menu.is_none() {
-                input += &self.hint;
-            }
+            input += &self.hint;
         }
 
         let lines = estimate_required_lines(&input, terminal_columns)
@@ -163,6 +161,33 @@ impl<'prompt> PromptLines<'prompt> {
         };
 
         resolve_wrap(end, terminal_columns).1
+    }
+
+    /// Rows from the prompt's first row to the last row of the line the
+    /// cursor is on, with the text after the cursor on that line and, at the
+    /// end of the buffer, the hint. A menu opens below it, so it draws over
+    /// neither.
+    pub(crate) fn distance_to_cursor_line_end(&self, terminal_columns: u16) -> u16 {
+        let (rest_of_line, hint) = match self.after_cursor.split_once('\n') {
+            Some((rest_of_line, _)) => (rest_of_line.trim_end_matches('\r'), ""),
+            None => (
+                &*self.after_cursor,
+                self.hint.lines().next().unwrap_or_default(),
+            ),
+        };
+        let end_row = wrap_position(
+            [
+                &*self.prompt_str_left,
+                &self.prompt_indicator,
+                &self.before_cursor,
+                rest_of_line,
+                hint,
+            ],
+            terminal_columns,
+        )
+        .map_or(0, |(_, row)| row);
+
+        end_row.max(self.distance_from_prompt(terminal_columns))
     }
 
     /// Calculate the cursor pos, based on the buffer and prompt.
@@ -458,6 +483,46 @@ mod tests {
 
         assert_eq!(
             prompt_lines.distance_from_prompt(terminal_columns),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::cursor_row_only("> ", "abc", "", "", 20, 0)]
+    #[case::hint_wraps_past_the_cursor("> ", &"a".repeat(14), "", "hint!!", 20, 1)]
+    #[case::hint_fills_the_row_exactly("> ", &"a".repeat(14), "", "hint", 20, 0)]
+    #[case::text_after_the_cursor_wraps("> ", &"a".repeat(14), "bcdefg", "", 20, 1)]
+    #[case::hint_after_a_later_line_is_not_on_the_cursor_line(
+        "> ",
+        &"a".repeat(14),
+        "b\ncd",
+        "hint!!",
+        20,
+        0
+    )]
+    #[case::cursor_resolved_past_a_filled_row("> ", &"a".repeat(18), "", "", 20, 1)]
+    fn test_distance_to_cursor_line_end(
+        #[case] prompt_indicator: &str,
+        #[case] before_cursor: &str,
+        #[case] after_cursor: &str,
+        #[case] hint: &str,
+        #[case] terminal_columns: u16,
+        #[case] expected: u16,
+    ) {
+        let prompt_lines = PromptLines {
+            prompt_str_left: Cow::Borrowed(""),
+            prompt_str_right: Cow::Borrowed(""),
+            prompt_indicator: Cow::Borrowed(prompt_indicator),
+            before_cursor: Cow::Borrowed(before_cursor),
+            after_cursor: Cow::Borrowed(after_cursor),
+            hint: Cow::Borrowed(hint),
+            right_prompt_on_last_line: false,
+            exit_after_cursor: None,
+            status: Cow::Borrowed(""),
+        };
+
+        assert_eq!(
+            prompt_lines.distance_to_cursor_line_end(terminal_columns),
             expected
         );
     }

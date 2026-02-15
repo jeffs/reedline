@@ -695,11 +695,11 @@ impl Painter {
 
         // Menu start row
         let menu_start_row = menu.map(|menu| {
-            let cursor_distance = lines.distance_from_prompt(screen_width);
-            if cursor_distance >= screen_height.saturating_sub(1) {
+            let line_end_distance = lines.distance_to_cursor_line_end(screen_width);
+            if line_end_distance >= screen_height.saturating_sub(1) {
                 screen_height.saturating_sub(menu.min_rows())
             } else {
-                self.prompt_start_row.last_known_row() + cursor_distance + 1
+                self.prompt_start_row.last_known_row() + line_end_distance + 1
             }
         });
 
@@ -1450,11 +1450,11 @@ impl Painter {
             &lines.before_cursor,
         ]);
 
+        self.stdout.queue(Print(&lines.hint))?;
         if let Some(menu) = menu {
             self.print_status(lines, use_ansi_coloring, layout)?;
             self.print_menu(menu, use_ansi_coloring, layout)?;
         } else {
-            self.stdout.queue(Print(&lines.hint))?;
             self.print_status(lines, use_ansi_coloring, layout)?;
         }
 
@@ -1575,6 +1575,7 @@ impl Painter {
             } else {
                 self.stdout.queue(Print(&lines.after_cursor))?;
             }
+            self.stdout.queue(Print(&lines.hint))?;
             self.print_menu(menu, use_ansi_coloring, layout)?;
         } else {
             // Selecting lines for the hint
@@ -3833,6 +3834,21 @@ mod tests {
             !out.contains("\x1b[1;1H\x1b[J"),
             "None start row falls back to row 0 and must not erase from home cell; emitted: {out:?}"
         );
+    }
+
+    /// A hint wrapping past the cursor's row keeps its rows: the status line
+    /// and the menu open below them.
+    #[test]
+    fn test_layout_opens_menu_below_a_wrapped_hint() {
+        let painter = make_painter(20, 10, false);
+        let before_cursor = "a".repeat(14);
+        let mut lines = make_lines("", "> ", "", &before_cursor, "");
+        lines.hint = Cow::Borrowed("hint!!");
+        let menu = ReedlineMenu::EngineCompleter(Box::new(TestMenu::new("menu")));
+        let layout = painter.compute_layout(&lines, Some(&menu), 0, 1);
+
+        assert_eq!(layout.status_start_row, Some(2));
+        assert_eq!(layout.menu_start_row, Some(3));
     }
 
     #[test]

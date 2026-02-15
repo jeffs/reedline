@@ -486,6 +486,10 @@ impl Menu for ListMenu {
         self.row_position = index as u16;
     }
 
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.get_value()
+    }
+
     /// The buffer gets cleared with the actual value
     fn replace_in_buffer(&self, editor: &mut Editor) {
         replace_in_buffer(self.get_value(), editor, self.settings.output_mode);
@@ -582,6 +586,21 @@ impl Menu for ListMenu {
             }
 
             self.event = None;
+        }
+    }
+
+    /// A page sized before the status line took its rows is cut to the rows
+    /// left, keeping the selection on it.
+    fn relayout(&mut self, painter: &Painter) {
+        let printable_entries = self.printable_entries(painter);
+        let Some(page) = self.pages.get(self.page) else {
+            return;
+        };
+        if printable_entries < page.size {
+            self.set_actual_page_size(printable_entries);
+            self.row_position = self
+                .row_position
+                .min(printable_entries.saturating_sub(1) as u16);
         }
     }
 

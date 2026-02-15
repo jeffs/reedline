@@ -8,7 +8,10 @@ use std::{
 
 use nu_ansi_term::{Color, Style};
 
-use crate::{enums::ReedlineRawEvent, external_printer::ExternalOutput, CursorConfig};
+use crate::{
+    enums::ReedlineRawEvent, external_printer::ExternalOutput,
+    menu::menu_functions::floor_char_boundary, CursorConfig, Suggestion,
+};
 #[cfg(feature = "bashisms")]
 use crate::{
     history::SearchFilter,
@@ -2110,7 +2113,14 @@ impl Reedline {
                     None => Ok(EventStatus::Inapplicable),
                 }
             }
-            ReedlineEvent::HistoryHintComplete => Ok(self.accept_history_hint(true)),
+            ReedlineEvent::HistoryHintComplete => {
+                // With a menu open, this accepts the selected completion, as
+                // Enter does, without submitting the line.
+                if self.menu_took_the_key(prompt)? {
+                    return Ok(EventStatus::Handled);
+                }
+                Ok(self.accept_history_hint(true))
+            }
             ReedlineEvent::HistoryHintWordComplete => Ok(self.accept_history_hint(false)),
             ReedlineEvent::Esc => {
                 // Nothing to cancel is reported as such, so a binding like
@@ -3359,11 +3369,73 @@ impl Reedline {
         Ok(())
     }
 
+    /// Hands each active menu the cursor position and lets it process its
+    /// pending events, so the paint that follows sees the selection those
+    /// events produced. Returns the indicator of the menu left visible.
+    fn update_active_menus(
+        &mut self,
+        prompt: &dyn Prompt,
+        use_ansi_coloring: bool,
+    ) -> Option<String> {
+        let prompt_edit_mode = self.prompt_edit_mode();
+        let mut indicator = None;
+        for menu in self.menus.iter_mut().filter(|menu| menu.is_active()) {
+            // A menu still waiting on its first answer stays off screen, so a Tab
+            // resolving to one suggestion never draws a menu it takes away again.
+            let indicator_before = menu.is_visible().then(|| menu.indicator().to_owned());
+
+            // Menus that need the cursor position (ide menu) take it from a
+            // layout of the buffer as it stands before the update.
+            let cursor = self.editor.insertion_point();
+            let styled = self.highlighter.highlight(self.editor.get_buffer(), cursor);
+            let (before_cursor, after_cursor) = styled.render_around_insertion_point(
+                cursor,
+                prompt,
+                use_ansi_coloring,
+                self.painter.semantic_markers(),
+            );
+            let mut lines = PromptLines::new(
+                prompt,
+                prompt_edit_mode.clone(),
+                None,
+                &before_cursor,
+                &after_cursor,
+                "",
+            );
+            if let Some(indicator) = indicator_before {
+                lines.prompt_indicator = indicator.into();
+            }
+            menu.set_cursor_pos(lines.cursor_pos(self.painter.screen_width()));
+
+            menu.update_working_details(
+                &mut self.editor,
+                self.completer.as_mut(),
+                self.history.as_ref(),
+                &self.painter,
+            );
+
+            // That update is where a first answer lands and ends the opening phase,
+            // so ask again: the painter draws the visible menu, and an indicator
+            // saying otherwise would draw its rows under the ordinary prompt. The
+            // indicator sets the prompt width that positions the cursor, which the
+            // update consumes, so on the frame a menu opens that width lags by one
+            // paint.
+            if menu.is_visible() {
+                indicator = Some(menu.indicator().to_owned());
+            }
+        }
+        indicator
+    }
+
     /// Triggers a full repaint including the prompt parts
     ///
     /// Includes the highlighting and hinting calls.
     fn buffer_paint(&mut self, prompt: &dyn Prompt) -> Result<()> {
         let use_ansi_coloring = self.effective_ansi_coloring();
+        let menu_prompt_indicator = self.update_active_menus(prompt, use_ansi_coloring);
+
+        // Highlighted after the menus ran, since one may have edited the
+        // buffer; the ghost hint below never does.
         let cursor_position_in_buffer = self.editor.insertion_point();
         let buffer_to_paint = self.editor.get_buffer();
 
@@ -3407,13 +3479,33 @@ impl Reedline {
             None => buffer_to_paint,
         };
 
+        // A visible menu previews its selected completion as a dimmed suffix
+        // after the cursor, in place of the hinter's hint.
+        let ghost_hint = self
+            .menus
+            .iter()
+            .find(|menu| menu.is_visible())
+            .map(|menu| {
+                menu.selected_value()
+                    .map_or_else(String::new, |suggestion| {
+                        compute_ghost_hint(
+                            &suggestion,
+                            buffer_to_paint,
+                            cursor_position_in_buffer,
+                            use_ansi_coloring,
+                        )
+                    })
+            });
+
         // Decided from the hint this paint looked up, never a stale one: the
         // paint that submit makes with hints hidden must draw the closers.
         let mut hint_replaces_closers = false;
         // Escaped here rather than in each hinter, so a host's own hinter is
         // covered too. SGR is kept only while coloring is on: hinters style
         // their own output, and with coloring off any SGR came from history.
-        let hint: String = if self.hints_active() {
+        let hint: String = if let Some(ghost_hint) = ghost_hint {
+            ghost_hint
+        } else if self.hints_active() {
             self.hinter.as_mut().map_or_else(String::new, |hinter| {
                 let hint = hinter.handle(
                     hinted_line,
@@ -3493,10 +3585,9 @@ impl Reedline {
         // the whole buffer.
         let screen_width = self.painter.screen_width();
         let status_room = if self.status_line.is_some() && !self.hide_hints {
-            // An open menu hides the hint, so measure the block the painter
-            // draws above it. Active, not visible: a menu opening on this
-            // paint turns visible only in its update below. One that stays
-            // hidden gets its status line checked again by the painter.
+            // Measure the block the painter draws above an open menu. One
+            // that stays hidden gets its status line checked again by the
+            // painter.
             let block_rows = match self.menus.iter().find(|menu| menu.is_active()) {
                 Some(menu) => lines
                     .required_lines(screen_width, false, Some(menu))
@@ -3519,39 +3610,16 @@ impl Reedline {
             _ => String::new(),
         };
         let mut lines = lines.with_status(&status, use_ansi_coloring);
-        // Before the menus size themselves below the status line.
+        // The menus updated before the hint they preview was known, so they
+        // fit themselves to the rows left below the status line only now.
         self.painter
             .reserve_status_rows(lines.status_rows(screen_width), status_room);
+        for menu in self.menus.iter_mut().filter(|menu| menu.is_active()) {
+            menu.relayout(&self.painter);
+        }
 
-        // Updating the working details of the active menu
-        for menu in self.menus.iter_mut() {
-            if menu.is_active() {
-                // A menu still waiting on its first answer stays off screen, so a Tab
-                // resolving to one suggestion never draws a menu it takes away again.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
-                }
-                // If the menu requires the cursor position, update it (ide menu)
-                let cursor_pos = lines.cursor_pos(screen_width);
-                menu.set_cursor_pos(cursor_pos);
-
-                menu.update_working_details(
-                    &mut self.editor,
-                    self.completer.as_mut(),
-                    self.history.as_ref(),
-                    &self.painter,
-                );
-
-                // That update is where a first answer lands and ends the opening phase,
-                // so ask again: the painter picks the menu to draw below, and an
-                // indicator saying otherwise would draw its rows under the ordinary
-                // prompt. Reading it twice is the price of the loop: the indicator sets
-                // the prompt width that positions the cursor, which the update consumes,
-                // so on the frame a menu opens that width lags by one paint.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
-                }
-            }
+        if let Some(indicator) = menu_prompt_indicator {
+            lines.prompt_indicator = indicator.into();
         }
 
         let menu = self.menus.iter().find(|menu| menu.is_visible());
@@ -3778,13 +3846,58 @@ fn closer_offsets_for_hint(
     sound.then_some(offsets)
 }
 
+/// Compute the ghost-text hint for a menu suggestion.
+///
+/// Returns the portion of the suggestion that extends beyond what the user
+/// has already typed, styled in dim gray when ANSI coloring is enabled.
+/// The buffer is never modified — this is purely a display string.
+fn compute_ghost_hint(
+    suggestion: &Suggestion,
+    buffer: &str,
+    cursor_pos: usize,
+    use_ansi_coloring: bool,
+) -> String {
+    let span_start = floor_char_boundary(buffer, suggestion.span.start);
+    let span_end = floor_char_boundary(buffer, suggestion.span.end.min(cursor_pos));
+    let chars_before_cursor = span_end.saturating_sub(span_start);
+    let safe_offset = floor_char_boundary(&suggestion.value, chars_before_cursor);
+
+    if safe_offset >= suggestion.value.len() {
+        // The user has already typed the entire suggestion (or more).
+        // Only show trailing whitespace if applicable.
+        if suggestion.append_whitespace {
+            let suffix = " ";
+            if use_ansi_coloring {
+                Style::new().fg(Color::DarkGray).paint(suffix).to_string()
+            } else {
+                suffix.to_string()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        let ghost = &suggestion.value[safe_offset..];
+        let ghost = if suggestion.append_whitespace {
+            format!("{ghost} ")
+        } else {
+            ghost.to_string()
+        };
+        if use_ansi_coloring {
+            Style::new().fg(Color::DarkGray).paint(&ghost).to_string()
+        } else {
+            ghost
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal_extensions::semantic_prompt::PromptKind;
     use crate::{
-        ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, Direction, FindStop,
-        ListMenu, MenuBuilder, MotionTarget, PromptHelixMode, PromptViMode, Span, Suggestion,
+        ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, Direction, EditCommand,
+        FindStop, HistoryItem, ListMenu, MenuBuilder, MotionTarget, PromptHelixMode, PromptViMode,
+        ReedlineMenu, Span, Suggestion,
     };
     use rstest::rstest;
     use std::path::Path;
@@ -9573,7 +9686,7 @@ mod tests {
     // hint that never shows.
     #[test]
     fn open_menu_keeps_trailing_closers_out_of_the_hint() {
-        let (mut rl, asked) = paired_line_with_hint("(gs", "tat).branch", Some(&[3]));
+        let (mut rl, _) = paired_line_with_hint("(gs", "tat).branch", Some(&[3]));
         rl = rl.with_menu(ReedlineMenu::HistoryMenu(Box::new(
             ListMenu::default().with_name("history_menu"),
         )));
@@ -9584,9 +9697,14 @@ mod tests {
         .unwrap();
         assert!(menu_is_active(&rl), "setup: menu is open");
 
+        // A menu previews its selection in the hint's place, so the hinter's
+        // hint stays off screen along with any claim on the closers.
         let output = repaint_output(&mut rl);
-        assert_eq!(*asked.lock().unwrap(), ("(gs)".to_string(), 3));
         assert!(output.contains(')'), "closers dropped: {output:?}");
+        assert!(
+            !output.contains("tat"),
+            "hint drawn under a menu: {output:?}"
+        );
 
         accept_hint(&mut rl, true);
         assert_eq!(buffer_and_cursor(&rl), ("(gs)", 3));
@@ -10042,5 +10160,361 @@ mod tests {
         assert!(!output.contains(hint));
         assert!(output.contains("ls27"));
         assert!(!output.contains("ls28"));
+    }
+
+    // ── Ghost text test helpers ────────────────────────────────────
+
+    /// A completer that returns a fixed set of suggestions for any input.
+    struct FakeCompleter {
+        completions: Vec<String>,
+    }
+
+    impl FakeCompleter {
+        fn new(completions: &[&str]) -> Self {
+            Self {
+                completions: completions.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+    }
+
+    impl Completer for FakeCompleter {
+        fn complete(&mut self, _line: &str, pos: usize) -> CompletionResult {
+            CompletionResult::fresh(
+                self.completions
+                    .iter()
+                    .map(|c| Suggestion {
+                        value: c.clone(),
+                        span: Span { start: 0, end: pos },
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    /// Build a Reedline with a fake completer and columnar completion menu,
+    /// pre-loaded with the given buffer text and a simulated 80x24 terminal.
+    fn reedline_with_menu(buffer: &str, completions: &[&str]) -> Reedline {
+        let completer = Box::new(FakeCompleter::new(completions));
+        let menu = ColumnarMenu::default().with_name("completion_menu");
+        let mut rl = Reedline::create()
+            .with_completer(completer)
+            .with_quick_completions(true)
+            .with_partial_completions(false)
+            .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)));
+        rl.editor
+            .set_buffer(buffer.to_string(), UndoBehavior::CreateUndoPoint);
+        // Set a non-zero terminal size so the painter doesn't divide by zero
+        rl.painter.handle_resize(80, 24);
+        rl.painter.force_prompt_anchored_for_test(0);
+        rl
+    }
+
+    /// Build a Reedline with a history menu (ListMenu backed by history),
+    /// pre-populated with history entries and a simulated 80x24 terminal.
+    fn reedline_with_history_menu(buffer: &str, history_entries: &[&str]) -> Reedline {
+        let menu = ListMenu::default().with_name("history_menu");
+        let mut rl = Reedline::create().with_menu(ReedlineMenu::HistoryMenu(Box::new(menu)));
+        for entry in history_entries {
+            rl.history
+                .save(HistoryItem::from_command_line(*entry))
+                .expect("Failed to save history");
+        }
+        rl.editor
+            .set_buffer(buffer.to_string(), UndoBehavior::CreateUndoPoint);
+        rl.painter.handle_resize(80, 24);
+        rl.painter.force_prompt_anchored_for_test(0);
+        rl
+    }
+
+    // ── Ghost hint computation unit tests ───────────────────────────
+
+    #[test]
+    fn ghost_hint_basic() {
+        // "he" + completion "hello" → ghost "llo"
+        let suggestion = Suggestion {
+            value: "hello".into(),
+            span: Span { start: 0, end: 2 },
+            append_whitespace: false,
+            ..Default::default()
+        };
+        let ghost = compute_ghost_hint(&suggestion, "he", 2, false);
+        assert_eq!(ghost, "llo");
+    }
+
+    #[test]
+    fn ghost_hint_full_replacement() {
+        // "" + completion "git status" → ghost "git status"
+        let suggestion = Suggestion {
+            value: "git status".into(),
+            span: Span { start: 0, end: 0 },
+            append_whitespace: false,
+            ..Default::default()
+        };
+        let ghost = compute_ghost_hint(&suggestion, "", 0, false);
+        assert_eq!(ghost, "git status");
+    }
+
+    #[test]
+    fn ghost_hint_append_whitespace() {
+        let suggestion = Suggestion {
+            value: "hello".into(),
+            span: Span { start: 0, end: 2 },
+            append_whitespace: true,
+            ..Default::default()
+        };
+        let ghost = compute_ghost_hint(&suggestion, "he", 2, false);
+        assert_eq!(ghost, "llo ");
+    }
+
+    #[test]
+    fn ghost_hint_no_completion() {
+        // When there is no remaining text, ghost should be empty.
+        let suggestion = Suggestion {
+            value: "he".into(),
+            span: Span { start: 0, end: 2 },
+            append_whitespace: false,
+            ..Default::default()
+        };
+        let ghost = compute_ghost_hint(&suggestion, "he", 2, false);
+        assert_eq!(ghost, "");
+    }
+
+    #[test]
+    fn ghost_hint_with_ansi() {
+        let suggestion = Suggestion {
+            value: "hello".into(),
+            span: Span { start: 0, end: 2 },
+            append_whitespace: false,
+            ..Default::default()
+        };
+        let ghost = compute_ghost_hint(&suggestion, "he", 2, true);
+        // Should contain the ghost text wrapped in ANSI codes
+        assert!(
+            ghost.contains("llo"),
+            "ghost should contain 'llo': {ghost:?}"
+        );
+        // Should have ANSI escape codes for DarkGray
+        assert!(
+            ghost.contains("\x1b["),
+            "ghost should have ANSI codes: {ghost:?}"
+        );
+    }
+
+    // ── Integration tests: buffer unchanged during navigation ───────
+
+    #[test]
+    fn menu_buffer_unchanged_during_navigation() {
+        // With ghost text, the buffer is NEVER modified during preview.
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Buffer must still be "he" — ghost text is display-only
+        assert_eq!(
+            rl.current_buffer_contents(),
+            "he",
+            "buffer must not change during menu navigation",
+        );
+    }
+
+    #[test]
+    fn menu_accept_applies_completion() {
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Accept with Enter
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Enter);
+
+        let buf = rl.current_buffer_contents();
+        assert!(
+            ["hello", "help", "hero"].contains(&buf),
+            "Enter should apply the completion, got: {buf:?}",
+        );
+    }
+
+    #[test]
+    fn menu_cancel_leaves_buffer_unchanged() {
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Cancel via Escape
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Esc);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        assert_eq!(
+            rl.current_buffer_contents(),
+            "he",
+            "Esc should leave buffer at original 'he'",
+        );
+    }
+
+    #[test]
+    fn menu_ctrl_f_accepts_completion() {
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Ctrl-F (HistoryHintComplete) accepts the selected completion
+        let _ = rl.handle_event(&prompt, ReedlineEvent::HistoryHintComplete);
+
+        let buf = rl.current_buffer_contents();
+        assert!(
+            ["hello", "help", "hero"].contains(&buf),
+            "Ctrl-F should accept the completion, got: {buf:?}",
+        );
+        // Menu should be deactivated
+        assert!(
+            !rl.menus.iter().any(|m| m.is_active()),
+            "menu should be deactivated after Ctrl-F accept",
+        );
+    }
+
+    #[test]
+    fn history_menu_accept_keeps_entry() {
+        let mut rl = reedline_with_history_menu("", &["ls -la", "echo hello", "git status"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("history_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Accept with Enter
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Enter);
+
+        let buf = rl.current_buffer_contents();
+        assert!(
+            ["ls -la", "echo hello", "git status"].contains(&buf),
+            "accepted value should be a history entry, got: {buf:?}",
+        );
+    }
+
+    // ── Reverse search regression ──────────────────────────────────
+
+    #[test]
+    fn search_history_unaffected() {
+        let mut rl = Reedline::create();
+        rl.painter.handle_resize(80, 24);
+
+        for cmd in ["ls -la", "echo hello", "git status"] {
+            rl.history
+                .save(HistoryItem::from_command_line(cmd))
+                .expect("save history");
+        }
+
+        rl.editor
+            .set_buffer("before".to_string(), UndoBehavior::CreateUndoPoint);
+
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::SearchHistory);
+        assert_eq!(rl.input_mode, InputMode::HistorySearch);
+
+        for ch in ['g', 'i', 't'] {
+            let _ = rl.handle_event(
+                &prompt,
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar(ch)]),
+            );
+        }
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Enter);
+        assert_eq!(rl.input_mode, InputMode::Regular);
+
+        let buf = rl.current_buffer_contents();
+        assert!(
+            buf.contains("git"),
+            "after accepting search, buffer should contain a git command, got: {buf:?}",
+        );
+    }
+
+    #[test]
+    fn menu_reactivate_after_cancel() {
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        // First activation and cancel
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Esc);
+        assert_eq!(rl.current_buffer_contents(), "he");
+
+        // Second activation should work normally
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Buffer still unchanged (ghost text model)
+        assert_eq!(rl.current_buffer_contents(), "he");
+
+        // Accept works
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Enter);
+        let buf = rl.current_buffer_contents();
+        assert!(
+            ["hello", "help", "hero"].contains(&buf),
+            "accept after reactivation should work, got: {buf:?}",
+        );
+    }
+
+    #[test]
+    fn menu_empty_completions() {
+        let mut rl = reedline_with_menu("xyz", &[]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+
+        assert_eq!(
+            rl.current_buffer_contents(),
+            "xyz",
+            "empty completions should leave buffer unchanged",
+        );
+    }
+
+    #[test]
+    fn menu_no_undo_pollution() {
+        // With ghost text, the buffer is never modified during preview,
+        // so undo should never contain preview artifacts.
+        let mut rl = reedline_with_menu("he", &["hello", "help", "hero"]);
+        let prompt = DefaultPrompt::default();
+
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Menu("completion_menu".into()));
+        rl.repaint(&prompt).expect("repaint failed");
+        let _ = rl.handle_event(&prompt, ReedlineEvent::MenuNext);
+        rl.repaint(&prompt).expect("repaint failed");
+        rl.repaint(&prompt).expect("repaint failed");
+
+        // Cancel
+        let _ = rl.handle_event(&prompt, ReedlineEvent::Esc);
+        rl.repaint(&prompt).expect("repaint failed");
+        assert_eq!(rl.current_buffer_contents(), "he");
+
+        // Undo should go back to empty, never to a completion value
+        rl.run_edit_commands(&[EditCommand::Undo]);
+        let buf = rl.current_buffer_contents();
+        assert!(
+            buf != "hello" && buf != "help" && buf != "hero",
+            "undo should not produce a preview artifact, got: {buf:?}",
+        );
     }
 }

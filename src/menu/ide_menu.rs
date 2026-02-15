@@ -846,6 +846,10 @@ impl Menu for IdeMenu {
         self.recompute_layout(painter);
     }
 
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.get_value()
+    }
+
     /// Apply via `CompletionDisplay::accept` (guards against stale spans)
     fn replace_in_buffer(&self, editor: &mut Editor) {
         self.completions

@@ -1042,7 +1042,7 @@ pub enum EditType {
 
 /// Every line change should come with an `UndoBehavior` tag, which can be used to
 /// calculate how the change should be reflected on the undo stack
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UndoBehavior {
     /// Character insertion, tracking the character inserted
     InsertCharacter(char),

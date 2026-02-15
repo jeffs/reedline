@@ -709,6 +709,14 @@ impl Menu for ColumnarMenu {
         self.recompute_layout(painter);
     }
 
+    fn relayout(&mut self, painter: &Painter) {
+        self.recompute_layout(painter);
+    }
+
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.get_values().get(self.index()).cloned()
+    }
+
     /// Replace buffer at span via completion display
     fn replace_in_buffer(&self, editor: &mut Editor) {
         self.completions

@@ -169,6 +169,10 @@ pub trait Menu: Send {
         painter: &Painter,
     );
 
+    /// Fits the menu to the rows the painter left it after its update, such
+    /// as those below a status line reserved since.
+    fn relayout(&mut self, _painter: &Painter) {}
+
     /// Indicates how to replace in the line buffer the selected value from the menu
     fn replace_in_buffer(&self, editor: &mut Editor);
 
@@ -230,6 +234,12 @@ pub trait Menu: Send {
 
     /// Select the entry with the given index.
     fn set_selection(&mut self, _index: usize) {}
+
+    /// Returns the currently selected suggestion, if any.
+    /// Used for ghost-text preview without modifying the buffer.
+    fn selected_value(&self) -> Option<Suggestion> {
+        None
+    }
 }
 
 /// Struct to store configuration for a menu.
@@ -670,6 +680,10 @@ impl Menu for ReedlineMenu {
         self.as_ref().replace_in_buffer(editor);
     }
 
+    fn relayout(&mut self, painter: &Painter) {
+        self.as_mut().relayout(painter);
+    }
+
     fn menu_required_lines(&self, terminal_columns: u16) -> u16 {
         self.as_ref().menu_required_lines(terminal_columns)
     }
@@ -712,6 +726,10 @@ impl Menu for ReedlineMenu {
 
     fn set_selection(&mut self, index: usize) {
         self.as_mut().set_selection(index);
+    }
+
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.as_ref().selected_value()
     }
 }
 

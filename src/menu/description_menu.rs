@@ -606,14 +606,17 @@ impl Menu for DescriptionMenu {
         }
     }
 
+    fn selected_value(&self) -> Option<Suggestion> {
+        let mut suggestion = self.get_value()?;
+        if let Some(example) = self.example_index.and_then(|i| self.examples.get(i)) {
+            suggestion.value.clone_from(example);
+        }
+        Some(suggestion)
+    }
+
     /// The buffer gets replaced in the Span location
     fn replace_in_buffer(&self, editor: &mut Editor) {
-        if let Some(mut suggestion) = self.get_value() {
-            if let Some(example) = self.example_index.and_then(|i| self.examples.get(i)) {
-                suggestion.value.clone_from(example);
-            }
-            replace_in_buffer(Some(suggestion), editor, self.settings.output_mode);
-        }
+        replace_in_buffer(self.selected_value(), editor, self.settings.output_mode);
     }
 
     /// Minimum rows that should be displayed by the menu
